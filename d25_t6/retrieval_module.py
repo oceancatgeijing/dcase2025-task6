@@ -58,6 +58,7 @@ class AudioRetrievalModel(pl.LightningModule):
             # 最终输出一个标量分数
             self.score_head = torch.nn.Linear(1024, 1)
 
+            
         self.validation_outputs = []
 
         self.kwargs = kwargs
@@ -90,13 +91,36 @@ class AudioRetrievalModel(pl.LightningModule):
             score = self.score_head(combined_feature) # [B, 1]
             return score.squeeze(-1)
     
-    def forward(self, batch) -> Any:
-
-        # embed audio & text
-        text_embeddings = self.forward_text(batch)
-        audio_embeddings = self.forward_audio(batch)
-
-        return audio_embeddings, text_embeddings
+    def forward(self, batch):
+        if self.training_mode == 'transformer':
+            # 1. 音频特征：复用 forward_audio 的逻辑确保维度正确 (1024)
+            # 不要直接调用 self.audio_embedding_model，因为它返回的是序列特征
+            a_feat = self.forward_audio(batch) # 得到 [B, 1024]，且已做过投影
+            
+            # 2. 文本特征：修正键名 'text' -> 'captions'，并复用预处理逻辑
+            captions = []
+            for i, b in enumerate([c[0] for c in batch['captions']]):
+                if not isinstance(b, str): b = b[0]
+                captions.append(b.lower().translate(str.maketrans('', '', string.punctuation)))
+                
+            tokenized = self.tokenizer(
+                captions, add_special_tokens=True, padding='max_length', 
+                return_tensors='pt', max_length=32, truncation=True
+            ).to(self.device)
+    
+            # 修正：将 self.text_encoder 改为 self.text_embedding_model
+            t_feat = self.text_embedding_model(
+                input_ids=tokenized['input_ids'], 
+                attention_mask=tokenized['attention_mask']
+            )[0][:, 0, :] # 取 CLS token
+            t_feat = self.text_projection(t_feat) # 投影到 1024
+            
+            return a_feat, t_feat
+        else:
+            # Bi-encoder 逻辑保持不变
+            audio_embeddings = self.forward_audio(batch)
+            text_embeddings = self.forward_text(batch)
+            return audio_embeddings, text_embeddings
 
     def forward_audio(self, batch):
 
@@ -153,61 +177,32 @@ class AudioRetrievalModel(pl.LightningModule):
         return sentence_features
 
     def training_step(self, batch, batch_idx):
-
-        self.lr_scheduler_step(batch_idx)
-
-        audio_embeddings, text_embeddings = self.forward(batch) # batch 1: sound IDs ['204046', '266329']; ['Paper_Parchment_Rustling.wav', 'metalTunnel.wav']
-
+        self.lr_scheduler_step(batch_idx) # 必须调用，否则学习率不更新
+    
         if self.training_mode == 'bi-encoder':
-            # 原有的双编码器对比损失逻辑
+            audio_embeddings, text_embeddings = self.forward(batch)
+            #
             C = torch.matmul(audio_embeddings, text_embeddings.T) / torch.abs(self.tau)
-            C_audio = torch.log_softmax(C, dim=0)
-            C_text = torch.log_softmax(C, dim=1)
-            paths = np.array([hash(batch['dataset'][i] + batch['subset'][i] + p) for i, p in enumerate(batch['fname'])])
-            I = torch.tensor(paths[None, :] == paths[:, None]).to(self.device)
-            loss = -0.5 * (C_audio[torch.where(I)].mean() + C_text[torch.where(I)].mean())
         else:
-            # Transformer 模式：引入负采样
-            batch_size = audio_embeddings.size(0)
+            # Transformer 融合逻辑
+            a_feat, t_feat = self.forward(batch) # 得到 [B, 1024]
+            batch_size = a_feat.shape[0]
             
-            # 1. 正样本得分
-            pos_scores = self.forward_fusion(audio_embeddings, text_embeddings)
-            
-            # 2. 负样本采样：将文本循环移动一位，构造不匹配对
-            text_embeds_neg = torch.roll(text_embeddings, shifts=1, dims=0)
-            neg_scores = self.forward_fusion(audio_embeddings, text_embeds_neg)
-            
-            # 3. 组合得分与标签
-            all_scores = torch.cat([pos_scores, neg_scores])
-            all_labels = torch.cat([torch.ones_like(pos_scores), torch.zeros_like(neg_scores)])
-            
-            # 4. 使用二分类交叉熵损失 (BCEWithLogitsLoss 不需要对 score 预先做 sigmoid)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(all_scores, all_labels)
-
+            # 构造相似度矩阵 C
+            C = torch.zeros((batch_size, batch_size), device=self.device)
+            for i in range(batch_size):
+                # 将当前音频 i 扩展，与整个 Batch 的文本 t_feat 融合计算
+                # a_feat[i].expand(batch_size, -1) 形状变为 [batch_size, 1024]
+                C[i] = self.forward_fusion(a_feat[i].expand(batch_size, -1), t_feat)
+        
+        # 统一计算对齐损失
+        labels = torch.arange(batch_size, device=self.device)
+        loss = (torch.nn.functional.cross_entropy(C, labels) + 
+                torch.nn.functional.cross_entropy(C.T, labels)) / 2
                 
-
-
-        # # compute pairwise similarities
-        # C = torch.matmul(audio_embeddings, text_embeddings.T)
-
-        # # scale cosine similarities with temperature < 1
-        # # (otherwise $-1 <= C_{ij} <= 1$)
-        # C = C / torch.abs(self.tau)
-
-        # compute P(a|t) and P(t|a)
-        # C_audio = torch.log_softmax(C, dim=0)
-        # C_text = torch.log_softmax(C, dim=1)
-
-        # # prediction target
-        # paths = np.array([hash(batch['dataset'][i] + batch['subset'][i] + p) for i, p in enumerate(batch['fname'])])
-        # I = torch.tensor(paths[None, :] == paths[:, None])
-
-        # loss = -0.5 * (C_audio[torch.where(I)].mean() + C_text[torch.where(I)].mean())
-
-        self.log("train/loss", loss, batch_size=len(audio_embeddings), sync_dist=True, prog_bar=True)
-        # self.log('train/tau', torch.abs(self.tau), sync_dist=True)
-
+        self.log("train/loss", loss, batch_size=batch_size, prog_bar=True)
         return loss
+            
 
     def validation_step(self, batch, batch_idx):
 
@@ -248,9 +243,24 @@ class AudioRetrievalModel(pl.LightningModule):
         audio_embeddings = torch.cat([o['audio_embeddings'] for o in outputs])[select]# only select unique audios
         text_embeddings = torch.cat([o['text_embeddings'] for o in outputs])
 
-        # concatenate global ranking
-        C = torch.matmul(text_embeddings, audio_embeddings.T)
+        # # concatenate global ranking
+        # C = torch.matmul(text_embeddings, audio_embeddings.T)
+        if self.training_mode == 'bi-encoder':
+            C = torch.matmul(text_embeddings, audio_embeddings.T)
+        else:
+            # Transformer 模式：必须通过融合层计算分值
+            print("Transformer 模式评估中，计算分值矩阵...")
+            num_texts = text_embeddings.shape[0]
+            num_audios = audio_embeddings.shape[0]
+            C = torch.zeros((num_texts, num_audios), device=self.device)
+            
+            # 5090 虽然快，但 N*N 推理依然耗时，我们按 Batch 分块计算
+            with torch.no_grad():
+                for i in range(num_texts):
+                    # 每次计算一个文本对所有音频的分数
+                    C[i] = self.forward_fusion(audio_embeddings, text_embeddings[i].expand(num_audios, -1))
 
+        
         # get top 10
         top_ten = C.topk(10, dim=1)[1].detach().cpu().numpy()
         target = np.array(target)
