@@ -55,8 +55,19 @@ class AudioRetrievalModel(pl.LightningModule):
             # 这里使用标准 Transformer 层，输入维度为 1024
             encoder_layer = torch.nn.TransformerEncoderLayer(d_model=1024, nhead=8, batch_first=True)
             self.fusion_transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=3)
+            
+            # --- 新增：初始化 CLS Token ---
+            self.cls_token = torch.nn.Parameter(torch.empty(1, 1, 1024))
+            torch.nn.init.normal_(self.cls_token, std=0.02)
+            # ----------------------------
+            
             # 最终输出一个标量分数
             self.score_head = torch.nn.Linear(1024, 1)
+            
+            # --- 新增：用于平衡量级的 LayerNorm ---
+            self.audio_ln = torch.nn.LayerNorm(1024)
+            self.text_ln = torch.nn.LayerNorm(1024)
+            # ------------------------------------
 
             
         self.validation_outputs = []
@@ -76,26 +87,45 @@ class AudioRetrievalModel(pl.LightningModule):
                 self.audio_embedding_model.model.model = torch.compile(self.audio_embedding_model.model.model)
 
     def forward_fusion(self, audio_embeds, text_embeds):
-            """
-            Transformer 融合逻辑：将音频和文本特征序列化后融合
-            """
-            # 假设 audio_embeds: [B, 1024], text_embeds: [B, 1024]
-            # 构造序列输入: [B, 2, 1024]
-            fusion_input = torch.stack([audio_embeds, text_embeds], dim=1) 
-            
-            # 通过 Transformer 提取融合特征
-            fusion_output = self.fusion_transformer(fusion_input) # [B, 2, 1024]
-            
-            # 取第一个 token 或平均值作为融合特征，并计算得分
-            combined_feature = fusion_output.mean(dim=1) # [B, 1024]
-            score = self.score_head(combined_feature) # [B, 1]
-            return score.squeeze(-1)
+        """
+        Transformer 融合逻辑：将音频和文本特征序列化后融合
+        """
+        # 获取当前 Batch 大小
+        B = audio_embeds.shape[0]
+
+        # 1. 扩展 CLS token 到当前 Batch 大小 [B, 1, 1024]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        
+        # 2. 将音频和文本堆叠: [B, 2, 1024]
+        audio_text = torch.stack([audio_embeds, text_embeds], dim=1) 
+
+        # 3. 拼接成最终输入序列: [CLS, Audio, Text] -> [B, 3, 1024]
+        fusion_input = torch.cat([cls_tokens, audio_text], dim=1)
+        
+        # 4. 通过 Transformer
+        fusion_output = self.fusion_transformer(fusion_input) # [B, 3, 1024]
+        
+        # 5. --- 关键改动：不再使用 mean，而是取位置 0 的 CLS token 输出 ---
+        combined_feature = fusion_output[:, 0, :] # [B, 1024]
+        
+        score = self.score_head(combined_feature) # [B, 1]
+        return score.squeeze(-1)
     
     def forward(self, batch):
         if self.training_mode == 'transformer':
-            # 1. 音频特征：复用 forward_audio 的逻辑确保维度正确 (1024)
-            # 不要直接调用 self.audio_embedding_model，因为它返回的是序列特征
-            a_feat = self.forward_audio(batch) # 得到 [B, 1024]，且已做过投影
+            # 1. 音频特征：手动实现逻辑以跳过 L2 归一化 (不调用 forward_audio)
+            audio_embeddings = self.audio_embedding_model(batch['audio'].mean(1))
+            aggregated = []
+            for i, duration in enumerate(batch['duration']):
+                if duration <= 10:
+                    aggregated.append(audio_embeddings[i, 0])
+                elif duration <= 20:
+                    aggregated.append(audio_embeddings[i, :2].mean(-2))
+                else:
+                    aggregated.append(audio_embeddings[i].mean(-2))
+            
+            a_feat = torch.stack(aggregated)
+            a_feat = self.audio_projection(a_feat)  # 投影到 1024，但不归一化
             
             # 2. 文本特征：修正键名 'text' -> 'captions'，并复用预处理逻辑
             captions = []
@@ -114,7 +144,11 @@ class AudioRetrievalModel(pl.LightningModule):
                 attention_mask=tokenized['attention_mask']
             )[0][:, 0, :] # 取 CLS token
             t_feat = self.text_projection(t_feat) # 投影到 1024
-            
+
+            # 归一化
+            a_feat = self.audio_ln(a_feat)
+            t_feat = self.text_ln(t_feat)
+
             return a_feat, t_feat
         else:
             # Bi-encoder 逻辑保持不变
@@ -259,7 +293,6 @@ class AudioRetrievalModel(pl.LightningModule):
                 for i in range(num_texts):
                     # 每次计算一个文本对所有音频的分数
                     C[i] = self.forward_fusion(audio_embeddings, text_embeddings[i].expand(num_audios, -1))
-
         
         # get top 10
         top_ten = C.topk(10, dim=1)[1].detach().cpu().numpy()

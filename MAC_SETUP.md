@@ -195,6 +195,11 @@ python -m d25_t6.train \
     --seed=13 \
     --training_mode bi-encoder
 
+# 设置学术环境
+source /etc/network_turbo
+# 5090上跑transformer
+python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=40     --s_patchout_f=4     --no-compile     --training_mode transformer --no-logging
+
 #win 不设置wandb
 python -m d25_t6.train --data_path=data --batch_size=8 --batch_size_eval=8 --n_workers=8 --no-compile --seed=13 --training_mode bi-encoder --no-logging
 
