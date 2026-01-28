@@ -51,23 +51,32 @@ class AudioRetrievalModel(pl.LightningModule):
         self.tau = torch.nn.Parameter(initial_tau, requires_grad=kwargs['tau_trainable'])
         
         if self.training_mode == 'transformer':
-            # 定义一个简单的 Fusion Transformer
-            # 这里使用标准 Transformer 层，输入维度为 1024
-            encoder_layer = torch.nn.TransformerEncoderLayer(d_model=1024, nhead=8, batch_first=True)
-            self.fusion_transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=3)
+            # --- 交叉注意力核心层 ---
+            # 我们定义 3 层交叉注意力交互
+            self.num_fusion_layers = 6
+            self.audio_to_text_attn = torch.nn.ModuleList([
+                torch.nn.MultiheadAttention(embed_dim=1024, num_heads=8, batch_first=True)
+                for _ in range(self.num_fusion_layers)
+            ])
+            self.text_to_audio_attn = torch.nn.ModuleList([
+                torch.nn.MultiheadAttention(embed_dim=1024, num_heads=8, batch_first=True)
+                for _ in range(self.num_fusion_layers)
+            ])
             
-            # --- 新增：初始化 CLS Token ---
+            # 用于收集最终信息的 CLS Token
             self.cls_token = torch.nn.Parameter(torch.empty(1, 1, 1024))
             torch.nn.init.normal_(self.cls_token, std=0.02)
-            # ----------------------------
             
-            # 最终输出一个标量分数
+            # 新增：专门用于最后提取 CLS 信息的层
+            self.output_attn = torch.nn.MultiheadAttention(
+                embed_dim=1024, 
+                num_heads=8, 
+                batch_first=True
+            )
+            
             self.score_head = torch.nn.Linear(1024, 1)
-            
-            # --- 新增：用于平衡量级的 LayerNorm ---
             self.audio_ln = torch.nn.LayerNorm(1024)
             self.text_ln = torch.nn.LayerNorm(1024)
-            # ------------------------------------
 
             
         self.validation_outputs = []
@@ -88,28 +97,43 @@ class AudioRetrievalModel(pl.LightningModule):
 
     def forward_fusion(self, audio_embeds, text_embeds):
         """
-        Transformer 融合逻辑：将音频和文本特征序列化后融合
+        使用交叉注意力 (Cross-Attention) 进行深度融合
+        audio_embeds: [B, 1024] 或 [B, N_seg, 1024]
+        text_embeds: [B, 1024] 或 [B, N_token, 1024]
         """
-        # 获取当前 Batch 大小
         B = audio_embeds.shape[0]
+        
+        # 确保输入是序列格式 [B, L, D]
+        # 如果是全局向量，增加序列维度
+        if audio_embeds.ndim == 2:
+            audio_embeds = audio_embeds.unsqueeze(1)
+        if text_embeds.ndim == 2:
+            text_embeds = text_embeds.unsqueeze(1)
 
-        # 1. 扩展 CLS token 到当前 Batch 大小 [B, 1, 1024]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        
-        # 2. 将音频和文本堆叠: [B, 2, 1024]
-        audio_text = torch.stack([audio_embeds, text_embeds], dim=1) 
+        # 1. 注入 CLS Token 准备收集融合后的信息
+        x = self.cls_token.expand(B, -1, -1) # [B, 1, 1024]
 
-        # 3. 拼接成最终输入序列: [CLS, Audio, Text] -> [B, 3, 1024]
-        fusion_input = torch.cat([cls_tokens, audio_text], dim=1)
-        
-        # 4. 通过 Transformer
-        fusion_output = self.fusion_transformer(fusion_input) # [B, 3, 1024]
-        
-        # 5. --- 关键改动：不再使用 mean，而是取位置 0 的 CLS token 输出 ---
-        combined_feature = fusion_output[:, 0, :] # [B, 1024]
-        
-        score = self.score_head(combined_feature) # [B, 1]
+        # 2. 交叉注意力循环
+        for i in range(self.num_fusion_layers):
+            # A. 文本关注音频: Query 是文本, Key/Value 是音频
+            # 这能让文本特征感知到音频中对应的声音事件
+            text_ctx, _ = self.text_to_audio_attn[i](text_embeds, audio_embeds, audio_embeds)
+            text_embeds = self.text_ln(text_embeds + text_ctx) # 残差连接
+
+            # B. 音频关注文本: Query 是音频, Key/Value 是文本
+            audio_ctx, _ = self.audio_to_text_attn[i](audio_embeds, text_embeds, text_embeds)
+            # 修复后的代码
+            audio_embeds = self.audio_ln(audio_embeds + audio_ctx)
+
+        # 3. 最后使用 CLS Token 作为 Query 从融合后的多模态池子中提取分数
+        # 将音频和文本拼接作为上下文
+        context = torch.cat([audio_embeds, text_embeds], dim=1)
+
+        fusion_feature, _ = self.output_attn(query=x, key=context, value=context)
+
+        score = self.score_head(fusion_feature.squeeze(1)) # [B, 1]
         return score.squeeze(-1)
+        
     
     def forward(self, batch):
         if self.training_mode == 'transformer':
