@@ -1,14 +1,32 @@
+import ast
 import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import os
+import sys
+import types
+from dataclasses import dataclass
+# --- 仅保留 aac-datasets 路径补丁 ---
+@dataclass
+class FakeAudioMetaData:
+    sample_rate: int; num_frames: int; num_channels: int; bits_per_sample: int; encoding: str
 
+backend = types.ModuleType("torchaudio.backend")
+common = types.ModuleType("torchaudio.backend.common")
+common.AudioMetaData = FakeAudioMetaData
+backend.common = common
+sys.modules["torchaudio.backend"] = backend
+sys.modules["torchaudio.backend.common"] = common
+# ----------------------------------
 from d25_t6.retrieval_module import AudioRetrievalModel
 from d25_t6.datasets.audio_loading import custom_loading
 from aac_datasets import Clotho
 from d25_t6.datasets.batch_collate import CustomCollate
+def _batch_to_device(batch, device):
+    """将 batch 中的张量移到指定设备（与 Lightning Trainer 行为一致）"""
+    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 def min_max_normalize(matrix):
     """将分数矩阵归一化到 [0, 1] 之间"""
@@ -45,6 +63,7 @@ def run_ensemble_eval(bi_ckpt_path, trans_ckpt_path, data_path='data'):
     print("Extracting embeddings...")
     with torch.no_grad():
         for batch in tqdm(test_loader):
+            batch = _batch_to_device(batch, device)
             # Bi-Encoder 特征 (带 L2 归一化)
             a_bi = model_bi.forward_audio(batch)
             t_bi = model_bi.forward_text(batch)
@@ -130,10 +149,51 @@ def run_ensemble_eval(bi_ckpt_path, trans_ckpt_path, data_path='data'):
     print(f"R@5:  {r5:.4f}")
     print(f"R@10: {r10:.4f}")
     print(f"mAP@10: {mAP:.4f}")
+    
+    # test_multiple_positives/mAP@10（需 resources/metadata_eval.csv）
+    metadata_path = "resources/metadata_eval.csv"
+    if os.path.exists(metadata_path):
+        matched_files = pd.read_csv(metadata_path)
+        matched_files["audio_filenames"] = matched_files["audio_filenames"].transform(
+            lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+        )
+        captions_list = all_captions  # 与 final_scores 行顺序一致
+        paths_list = unique_paths    # 与 final_scores 列顺序一致
+
+        def get_ranks_np(scores_row, relevant_indices):
+            """scores_row: (num_audios,), relevant_indices: list of int. 返回各相关音频的 0-based 排名"""
+            r = np.asarray(relevant_indices)
+            ranks = np.argsort(np.argsort(-np.asarray(scores_row)))[r]
+            return ranks.tolist()
+
+        matched_files["query_index"] = matched_files["query"].transform(
+            lambda x: captions_list.index(x)
+        )
+        matched_files["new_audio_indices"] = matched_files["audio_filenames"].transform(
+            lambda x: [paths_list.index(y) for y in x]
+        )
+        matched_files["TP_ranks"] = matched_files.apply(
+            lambda row: get_ranks_np(final_scores[row["query_index"]], row["new_audio_indices"]),
+            axis=1,
+        )
+
+        def average_precision_at_k(relevant_ranks, k=10):
+            relevant_ranks = sorted(relevant_ranks)
+            ap = 0.0
+            for i, rank in enumerate(relevant_ranks, start=1):
+                if rank >= k:
+                    break
+                ap += i / (rank + 1)
+            return ap / len(relevant_ranks) if relevant_ranks else 0.0
+
+        mAP_multi = matched_files["TP_ranks"].apply(lambda ranks: average_precision_at_k(ranks, 10)).mean()
+        print(f"test_multiple_positives/mAP@10: {mAP_multi:.4f}")
+    else:
+        print(f"test_multiple_positives/mAP@10: (skip, no {metadata_path})")
 
 if __name__ == "__main__":
     # 请替换为你真实的 ckpt 路径
     BI_CKPT = "checkpoints/spring-pine-8/epoch=19.ckpt"
-    TRANS_CKPT = "checkpoints/transformer_exp/epoch=15.ckpt"
+    TRANS_CKPT = "checkpoints/true-sea-9/epoch=14.ckpt"
     
     run_ensemble_eval(BI_CKPT, TRANS_CKPT)
