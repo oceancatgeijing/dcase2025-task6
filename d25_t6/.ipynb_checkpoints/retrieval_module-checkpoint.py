@@ -84,7 +84,8 @@ class AudioRetrievalModel(pl.LightningModule):
         self.kwargs = kwargs
 
         self.compile_model()
-
+    
+    
     def compile_model(self):
         """Apply torch.compile() if GPU is recent"""
         if torch.cuda.is_available():
@@ -235,30 +236,45 @@ class AudioRetrievalModel(pl.LightningModule):
         return sentence_features
 
     def training_step(self, batch, batch_idx):
-        self.lr_scheduler_step(batch_idx) # 必须调用，否则学习率不更新
-    
+        self.lr_scheduler_step(batch_idx)
+
+        # 1. 提取公共的哈希掩码（Multi-positive Mask）
+        # 无论哪种模式，都需要识别 Batch 内本质相同的音频，避免误判
+        paths = np.array([hash(batch['dataset'][i] + batch['subset'][i] + p) for i, p in enumerate(batch['fname'])])
+        I = torch.tensor(paths[None, :] == paths[:, None], device=self.device)
+        batch_size = len(paths)
+
         if self.training_mode == 'bi-encoder':
             audio_embeddings, text_embeddings = self.forward(batch)
-            #
+            # 计算相似度矩阵并缩放
             C = torch.matmul(audio_embeddings, text_embeddings.T) / torch.abs(self.tau)
         else:
             # Transformer 融合逻辑
-            a_feat, t_feat = self.forward(batch) # 得到 [B, 1024]
-            batch_size = a_feat.shape[0]
+            a_feat, t_feat = self.forward(batch) # [B, 1024]
             
             # 构造相似度矩阵 C
+            # 优化点：在 5090 上，可以考虑将循环内的 expand 进一步向量化，
+            # 但为了逻辑清晰，先保持 C 的计算逻辑，随后应用多正样本 Loss
             C = torch.zeros((batch_size, batch_size), device=self.device)
             for i in range(batch_size):
-                # 将当前音频 i 扩展，与整个 Batch 的文本 t_feat 融合计算
-                # a_feat[i].expand(batch_size, -1) 形状变为 [batch_size, 1024]
+                # 计算第 i 个音频与所有文本的融合分值
                 C[i] = self.forward_fusion(a_feat[i].expand(batch_size, -1), t_feat)
+            
+            # 注意：Transformer 分值通常不需要除以 tau，因为 score_head 已经学习了量纲
+            # 如果收敛慢，可以尝试 C = C / torch.abs(self.tau) 进行对齐
+
+        # 2. 统一使用支持多正样本的 Loss 计算逻辑
+        # 这种计算方式在 P(a|t) 和 P(t|a) 两个维度上都考虑了哈希掩码 I
+        C_audio = torch.log_softmax(C, dim=0) 
+        C_text = torch.log_softmax(C, dim=1)
         
-        # 统一计算对齐损失
-        labels = torch.arange(batch_size, device=self.device)
-        loss = (torch.nn.functional.cross_entropy(C, labels) + 
-                torch.nn.functional.cross_entropy(C.T, labels)) / 2
-                
-        self.log("train/loss", loss, batch_size=batch_size, prog_bar=True)
+        loss = -0.5 * (C_audio[torch.where(I)].mean() + C_text[torch.where(I)].mean())
+
+        # 3. 日志记录
+        self.log("train/loss", loss, batch_size=batch_size, prog_bar=True, sync_dist=True)
+        if self.training_mode == 'bi-encoder':
+            self.log('train/tau', torch.abs(self.tau), sync_dist=True)
+            
         return loss
             
 

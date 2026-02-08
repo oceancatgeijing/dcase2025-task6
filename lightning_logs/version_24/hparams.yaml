@@ -22,6 +22,6 @@ seed: 21208
 tau_trainable: false
 test: true
 train: true
-training_mode: mixed
+training_mode: transformer
 warmup_epochs: 1
 wavcaps: false

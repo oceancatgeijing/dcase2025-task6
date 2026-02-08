@@ -190,7 +190,7 @@ python -m d25_t6.train \
     --data_path=data \
     --batch_size=8 \
     --batch_size_eval=8 \
-    --n_workers=8 \
+    --n_workers=4 \
     --no-compile \
     --seed=13 \
     --training_mode bi-encoder
@@ -198,7 +198,11 @@ python -m d25_t6.train \
 # 设置学术环境
 source /etc/network_turbo
 # 5090上跑transformer
-python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=40     --s_patchout_f=4     --no-compile     --training_mode transformer --no-logging
+python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode transformer 
+
+# 跑biencoder模式（bi-encoder）
+python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode bi-encoder 
+
 
 #win 不设置wandb
 python -m d25_t6.train --data_path=data --batch_size=8 --batch_size_eval=8 --n_workers=8 --no-compile --seed=13 --training_mode bi-encoder --no-logging
@@ -209,6 +213,13 @@ python -m d25_t6.train
 --n_workers 4 
 --batch_size 2
 ```
+
+# git语句
+git status
+git add .
+git commit -m "内容"
+git push origin main
+
 
 **对于 Intel Mac:**
 
