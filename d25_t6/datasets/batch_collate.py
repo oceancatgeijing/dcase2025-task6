@@ -1,16 +1,19 @@
 from typing import List, Dict, Any
 
 import torch
+from aac_datasets.utils.collections import list_dict_to_dict_list  # 改用官方版本
 from torch import Tensor
 
-def list_dict_to_dict_list(list_dict):
-    """
-    手动实现该工具函数，绕过 aac_datasets 的版本兼容性问题。
-    功能：将 [{key: val1}, {key: val2}] 转换为 {key: [val1, val2]}
-    """
-    if not list_dict:
-        return {}
-    return {key: [d[key] for d in list_dict] for key in list_dict[0].keys()}
+# def list_dict_to_dict_list(list_dict):
+#     """
+#     手动实现该工具函数，绕过 aac_datasets 的版本兼容性问题。
+#     功能：将 [{key: val1}, {key: val2}] 转换为 {key: [val1, val2]}
+#     """
+#     if not list_dict:
+#         return {}
+#     return {key: [d[key] for d in list_dict] for key in list_dict[0].keys()}
+
+
 
 class CustomCollate:
     def __init__(self) -> None:

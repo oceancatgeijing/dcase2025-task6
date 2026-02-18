@@ -10,3 +10,4 @@ resources/
 # 忽略 Jupyter 缓存
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
+dcase2025_task6_baseline/

@@ -193,7 +193,7 @@ def run_ensemble_eval(bi_ckpt_path, trans_ckpt_path, data_path='data'):
 
 if __name__ == "__main__":
     # 请替换为你真实的 ckpt 路径
-    BI_CKPT = "checkpoints/spring-pine-8/epoch=19.ckpt"
-    TRANS_CKPT = "checkpoints/true-sea-9/epoch=14.ckpt"
+    BI_CKPT = "checkpoints/cosmic-paper-15/epoch=13.ckpt"
+    TRANS_CKPT = "checkpoints/revived-snowball-16/epoch=19.ckpt"
     
     run_ensemble_eval(BI_CKPT, TRANS_CKPT)
