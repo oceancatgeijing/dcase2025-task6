@@ -1,6 +1,6 @@
 git status
 git add .
-git commit -m "集成训练代码"
+git commit -m "基础模型训练完成，尝试融合架构"
 git push
 
 # 设置学术环境

@@ -11,3 +11,4 @@ resources/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 dcase2025_task6_baseline/
+useless/
