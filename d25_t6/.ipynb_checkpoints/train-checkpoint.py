@@ -254,6 +254,8 @@ def get_args() -> dict:
     parser.add_argument('--training_mode', type=str, default='bi-encoder', 
                         choices=['bi-encoder', 'transformer'],
                         help='选择训练方式: bi-encoder (双编码器) 或 transformer (融合编码器)')
+    parser.add_argument('--temporal_aware', default=False, action=argparse.BooleanOptionalAction, 
+                    help='启用时序感知模式：保留音频分段信息而非平均 (默认: False)')
     
     args = parser.parse_args()
     return vars(args)
