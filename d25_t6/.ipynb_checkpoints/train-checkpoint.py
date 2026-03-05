@@ -1,4 +1,5 @@
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.functional")
 warnings.filterwarnings("ignore", category=FutureWarning, module="hear21passt.models.preprocess")
 
@@ -60,6 +61,7 @@ from d25_t6.datasets.download_datasets import download_clotho, download_audiocap
 from d25_t6.datasets.audio_loading import custom_loading
 from d25_t6.datasets.utils import exclude_broken_files, exclude_forbidden_files, exclude_forbidden_and_long_files
 from d25_t6.datasets.batch_collate import CustomCollate
+from d25_t6.datasets.wavcaps_local import WavCapsLocalDataset  # 导入本地 WavCaps
 
 from d25_t6.retrieval_module import AudioRetrievalModel
 
@@ -125,6 +127,7 @@ def train(
         callbacks=[checkpoint_callback],
         max_epochs=args['max_epochs'],
         precision="32",
+        gradient_clip_val=1.0,
         # precision="bf16-mixed",
         num_sanity_val_steps=0,
         fast_dev_run=False
@@ -224,10 +227,10 @@ def get_args() -> dict:
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
     parser.add_argument('--batch_size_eval', type=int, default=64, help='Batch size for evaluation')
     parser.add_argument('--max_epochs', type=int, default=20, help='Maximum number of epochs')
-    parser.add_argument('--warmup_epochs', type=int, default=1, help='Number of warmup epochs')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs')
     parser.add_argument('--rampdown_epochs', type=int, default=15, help='Number of ramp-down epochs')
     parser.add_argument('--max_lr', type=float, default=2e-5, help='Maximum learning rate')
-    parser.add_argument('--min_lr', type=float, default=1e-7, help='Minimum learning rate')
+    parser.add_argument('--min_lr', type=float, default=2e-6, help='Minimum learning rate')
     parser.add_argument('--initial_tau', type=float, default=0.05, help='Initial tau value')
     parser.add_argument('--tau_trainable', default=False, action=argparse.BooleanOptionalAction, help='Temperature parameter is trainable or not.')
 
@@ -242,6 +245,16 @@ def get_args() -> dict:
     parser.add_argument('--wavcaps', default=False, action=argparse.BooleanOptionalAction, help='Include WavCaps in the training or not.')
     parser.add_argument('--audiocaps', default=False, action=argparse.BooleanOptionalAction, help='Include AudioCaps in the training or not.')
     parser.add_argument('--ablate_clean_setup', default=True, action=argparse.BooleanOptionalAction, help='Include ClothoV2.1 eval, test in the training or not.')
+
+    # 本地 WavCaps 参数
+    parser.add_argument('--wavcaps_local', default=False, action=argparse.BooleanOptionalAction, 
+                        help='使用本地 WavCaps CSV 标注（不通过 aac_datasets 下载）')
+    parser.add_argument('--wavcaps_csv', type=str, 
+                        default='/root/autodl-tmp/dcase2025/data/WavCaps_mp3/json_files/wavcaps_qwen3_omni_local_label.csv',
+                        help='本地 WavCaps 标注 CSV 文件路径')
+    parser.add_argument('--wavcaps_audio_root', type=str,
+                        default='/root/autodl-tmp/dcase2025/data/WavCaps_mp3/Audio',
+                        help='本地 WavCaps 音频文件根目录')
 
     # Paths
     parser.add_argument('--data_path', type=str, default='data', help='Path to dataset; dataset will be downloaded into this folder.')
@@ -268,6 +281,9 @@ if __name__ == '__main__':
     - Initializes logging and model.
     - Runs training and/or testing based on arguments.
     """
+    
+    # 必须先解析参数，后续才能使用 args
+    args = get_args()
 
     # 适配win和mac
     import platform
@@ -281,8 +297,6 @@ if __name__ == '__main__':
         default_workers = 16
         persistent_workers = True
 
-    args = get_args()
-
     os.makedirs(args["data_path"], exist_ok=True)
     # download data sets; will be ignored if exists
     # ClothoV2.1
@@ -290,7 +304,7 @@ if __name__ == '__main__':
     # AudioCAps
     if args['audiocaps']:
         download_audiocaps(args["data_path"])
-    # WavCaps
+    # WavCaps (通过 aac_datasets 下载的)
     if args['wavcaps']:
         download_wavcaps_mp3(args["data_path"])
         # download_wavcaps(args["data_path"], args["huggingface_cache_path"])
@@ -325,6 +339,7 @@ if __name__ == '__main__':
             )
             train_ds = torch.utils.data.ConcatDataset([train_ds, ac])
 
+        # 标准 WavCaps（通过 aac_datasets）
         if args['wavcaps']:
             # load the subsets
             wc_f = exclude_forbidden_files(custom_loading(WavCaps(subset="freesound", root=args["data_path"])))
@@ -332,6 +347,21 @@ if __name__ == '__main__':
             wc_s = custom_loading(WavCaps(subset="soundbible", root=args["data_path"]))
             wc_a = exclude_broken_files(custom_loading(WavCaps(subset="audioset_no_audiocaps" if not args["ablate_clean_setup"] else "audioset", root=args["data_path"])))
             train_ds = torch.utils.data.ConcatDataset([train_ds, wc_f, wc_b, wc_s, wc_a])
+        
+        # 本地 WavCaps（通过 CSV 加载）
+        if args['wavcaps_local']:
+            print(f"Loading local WavCaps from {args['wavcaps_csv']}")
+            wavcaps_local_ds = WavCapsLocalDataset(
+                csv_path=args['wavcaps_csv'],
+                audio_root=args['wavcaps_audio_root'],
+                target_sample_rate=32000,
+                max_length=30,
+                flat_captions=True,  # 展开为独立样本，增加多样性
+                sample_ratio=0.1
+            )
+            wavcaps_local_ds = custom_loading(wavcaps_local_ds)
+            train_ds = torch.utils.data.ConcatDataset([train_ds, wavcaps_local_ds])
+            print(f"Added {len(wavcaps_local_ds)} local WavCaps samples")
 
         val_ds = custom_loading(Clotho(subset="val", root=args["data_path"], flat_captions=True))
 

@@ -201,22 +201,39 @@ source /etc/network_turbo
 python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode transformer 
 
 # 跑transformer模式，包含audiocaps（transformer）
-python -m d25_t6.train     --audiocaps     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode transformer --temporal_aware 
+python -m d25_t6.train      --audiocaps     --data_path=data     --batch_size=8     --batch_size_eval=8     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode transformer --temporal_aware 
 
 # 跑biencoder模式（bi-encoder）
 python -m d25_t6.train     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode bi-encoder 
 
-# 跑biencoder模式，包含audiocaps（bi-encoder）
-python -m d25_t6.train     --audiocaps     --data_path=data     --batch_size=32     --batch_size_eval=32     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode=bi-encoder  --temporal_aware 
+# 跑transformer模式，包含audiocaps（bi-encoder）
+python -m d25_t6.train     --audiocaps  --wavcaps_local    --data_path=data     --batch_size=16     --batch_size_eval=16     --n_workers=8     --s_patchout_t=15     --s_patchout_f=2     --no-compile     --training_mode=transformer   
 
 #win 不设置wandb
 python -m d25_t6.train --data_path=data --batch_size=8 --batch_size_eval=8 --n_workers=8 --no-compile --seed=13 --training_mode bi-encoder --no-logging
+
+python -m d25_t6.train --audiocaps --data_path=data --batch_size=32 --batch_size_eval=32 --n_workers=8 --s_patchout_t=15 --s_patchout_f=2 --no-compile --training_mode transformer --temporal_aware 
 
 python -m d25_t6.train 
 --training_mode transformer 
 --devices 1 
 --n_workers 4 
 --batch_size 2
+
+# 接着训练
+python -m d25_t6.train \
+    --resume_ckpt_path=checkpoints/expert-capybara-36/last.ckpt \
+    --audiocaps \
+    --wavcaps_local \
+    --data_path=data \
+    --batch_size=16 \
+    --batch_size_eval=16 \
+    --n_workers=8 \
+    --s_patchout_t=15 \
+    --s_patchout_f=2 \
+    --no-compile \
+    --training_mode=transformer \
+    --max_epochs=30
 ```
 
 # git语句
