@@ -24,8 +24,11 @@ class AudioRetrievalModel(pl.LightningModule):
         self.temporal_aware = kwargs.get('temporal_aware', False)
         
         # 时序模式配置
-        self.max_temporal_segments = kwargs.get('max_temporal_segments', 30)
+        self.max_temporal_segments = kwargs.get('max_temporal_segments', 300)
         self.segment_duration = 10  # 每段10秒
+        
+        # 验证时分块大小（96G显存可设大些，如64或128）
+        self.eval_chunk_size = kwargs.get('eval_chunk_size', 64)
         
         print(f"[模型配置] 时序感知: {self.temporal_aware}, "
               f"最大时段数: {self.max_temporal_segments}, 模式: {self.training_mode}")
@@ -58,6 +61,9 @@ class AudioRetrievalModel(pl.LightningModule):
         initial_tau = torch.zeros((1,)) + kwargs['initial_tau']
         self.tau = torch.nn.Parameter(initial_tau, requires_grad=kwargs['tau_trainable'])
         
+        self.audio_ln = torch.nn.LayerNorm(1024)
+        self.text_ln = torch.nn.LayerNorm(1024)
+        
         if self.training_mode == 'transformer':
             self.num_fusion_layers = 6
             self.audio_to_text_attn = torch.nn.ModuleList([
@@ -79,23 +85,20 @@ class AudioRetrievalModel(pl.LightningModule):
             )
             
             self.score_head = torch.nn.Linear(1024, 1)
-            self.audio_ln = torch.nn.LayerNorm(1024)
-            self.text_ln = torch.nn.LayerNorm(1024)
+
             
             if self.temporal_aware:
-                # ========== 修改：时间编码嵌入到音频段 ==========
-                # 可学习的时段位置编码（相对位置：第0段、第1段...）
-                self.temporal_pos_embedding = nn.Parameter(
-                    torch.randn(self.max_temporal_segments, 1024) * 0.02
-                )
-                
-                # 可选：绝对时间编码（将秒数如0,10,20...编码为向量）
-                # 使用正弦位置编码或线性层
-                self.absolute_time_encoding = nn.Sequential(
-                    nn.Linear(1, 512),
-                    nn.ReLU(),
-                    nn.Linear(512, 1024)
-                )
+                # 注释掉位置编码和时间编码的定义（保留代码但不再创建参数）
+                # 如需彻底删除可完全删除以下代码块
+                pass
+                # self.temporal_pos_embedding = nn.Parameter(
+                #     torch.randn(self.max_temporal_segments, 1024) * 0.02
+                # )
+                # self.absolute_time_encoding = nn.Sequential(
+                #     nn.Linear(1, 512),
+                #     nn.ReLU(),
+                #     nn.Linear(512, 1024)
+                # )
 
         self.validation_outputs = []
         self.kwargs = kwargs
@@ -134,12 +137,21 @@ class AudioRetrievalModel(pl.LightningModule):
     
     def forward_fusion_temporal(self, audio_temporal, text_embeds):
         """
-        先时序注意力池化，再标准双向Cross-Attention
-        audio_temporal: [B, T, 1024]（带时间编码的音频时段）
-        text_embeds: [B, 1024] 或 [B, L, 1024]（纯文本特征）
+        时序融合 - 支持批量处理
+        audio_temporal: [B, T, 1024] 或 [B*N, T, 1024]
+        text_embeds: [B, 1024] 或 [B*N, 1024]
         """
-        B, T, D = audio_temporal.shape
-    
+        original_shape = audio_temporal.shape[:-2]
+        B = int(np.prod(original_shape))
+        T = audio_temporal.shape[-2]
+        
+        # 展平批量维度
+        audio_temporal = audio_temporal.view(B, T, -1)
+        if text_embeds.ndim == 2:
+            text_embeds = text_embeds.view(B, 1, -1)
+        else:
+            text_embeds = text_embeds.view(B, text_embeds.shape[-2], -1)
+        
         # 类型对齐
         target_dtype = self.audio_ln.weight.dtype
         if audio_temporal.dtype != target_dtype:
@@ -147,71 +159,58 @@ class AudioRetrievalModel(pl.LightningModule):
         if text_embeds.dtype != target_dtype:
             text_embeds = text_embeds.to(target_dtype)
         
-        # 确保文本有序列维度 [B, 1, 1024]
-        if text_embeds.ndim == 2:
-            text_embeds = text_embeds.unsqueeze(1)
+        # 步骤1: 文本指导的时序注意力池化（批量）
+        # with torch.no_grad():
+        _, attn_weights = self.text_to_audio_attn[0](
+            text_embeds,      # [B, L, 1024]
+            audio_temporal,   # [B, T, 1024]
+            audio_temporal    # [B, T, 1024]
+        )
+        # attn_weights: [B, L, T]
         
-        # ========== 步骤1: 文本指导的时序注意力池化 ==========
-        # 使用第一层计算文本对音频的注意力权重，并融合音频
-        with torch.no_grad():  # 仅作为池化权重，不计算梯度（避免与步骤2重复）
-            _, attn_weights = self.text_to_audio_attn[0](
-                text_embeds,      # Query: [B, 1, 1024]
-                audio_temporal,   # Key: [B, T, 1024]
-                audio_temporal    # Value: [B, T, 1024]
-            )
-            # attn_weights: [B, 1, T]，表示文本对每个音频时段的关注度
-        
-        # 加权融合：将T个时段压缩为1个向量 [B, 1, 1024]
+        # 加权融合 [B, L, 1024]
         audio_fused = torch.bmm(attn_weights, audio_temporal)
-        
-        # 对融合后的音频做LayerNorm
         audio_fused = self.audio_ln(audio_fused)
         
-        # ========== 步骤2: 类似非时序模式的双向Cross-Attention ==========
-        # 此时：text_embeds: [B, 1, 1024], audio_fused: [B, 1, 1024]
-        # 类似于 forward_fusion 的处理逻辑
-        
-        text_feat = text_embeds      # [B, 1, 1024]
-        audio_feat = audio_fused     # [B, 1, 1024]
+        # 步骤2: 双向Cross-Attention
+        text_feat = text_embeds
+        audio_feat = audio_fused
         
         for i in range(self.num_fusion_layers):
-            # 方向1: 文本查音频（融合后的单向量）
-            text_ctx, _ = self.text_to_audio_attn[i](
-                text_feat,      # [B, 1, 1024]
-                audio_feat,     # [B, 1, 1024]
-                audio_feat      # [B, 1, 1024]
-            )
+            text_ctx, _ = self.text_to_audio_attn[i](text_feat, audio_feat, audio_feat)
             text_feat = self.text_ln(text_feat + text_ctx)
             
-            # 方向2: 音频查文本
-            audio_ctx, _ = self.audio_to_text_attn[i](
-                audio_feat,     # [B, 1, 1024]
-                text_feat,      # [B, 1, 1024]（使用更新后的文本）
-                text_feat       # [B, 1, 1024]
-            )
+            audio_ctx, _ = self.audio_to_text_attn[i](audio_feat, text_feat, text_feat)
             audio_feat = self.audio_ln(audio_feat + audio_ctx)
         
-        # 最终聚合：拼接交互后的两者
-        context = torch.cat([text_feat, audio_feat], dim=1)  # [B, 2, 1024]
+        # 最终聚合
+        context = torch.cat([text_feat, audio_feat], dim=1)  # [B, 2*L, 1024]
         
-        # CLS token聚合
-        x = self.cls_token.expand(B, -1, -1)  # [B, 1, 1024]
+        x = self.cls_token.expand(B, -1, -1)
         fusion_feature, _ = self.output_attn(query=x, key=context, value=context)
         score = self.score_head(fusion_feature.squeeze(1))
+        
         return score.squeeze(-1)
         
     def aggregate_audio_segments(self, audio_embeddings, durations):
-        """非时序聚合"""
+        """非时序聚合 - 完全等价于原版的向量化实现"""
         batch_size = audio_embeddings.shape[0]
-        aggregated = []
-        for i, duration in enumerate(durations):
-            if duration <= 10:
-                aggregated.append(audio_embeddings[i, 0])
-            elif duration <= 20:
-                aggregated.append(audio_embeddings[i, :2].mean(-2))
+        
+        # 使用索引掩码实现原版逻辑：<=10s取第0段，<=20s取前2段，否则全取
+        indices = torch.arange(audio_embeddings.shape[1], device=audio_embeddings.device)
+        masks = []
+        for d in durations:
+            if d <= 10:
+                mask = (indices == 0).float()
+            elif d <= 20:
+                mask = (indices < 2).float()
             else:
-                aggregated.append(audio_embeddings[i].mean(-2))
-        aggregated = torch.stack(aggregated)
+                mask = torch.ones_like(indices, dtype=torch.float)
+            masks.append(mask)
+        mask = torch.stack(masks)  # [B, T]
+        
+        masked_embeds = audio_embeddings * mask.unsqueeze(-1)
+        aggregated = masked_embeds.sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-8)
         aggregated = self.audio_projection(aggregated)
         return aggregated
     
@@ -221,7 +220,7 @@ class AudioRetrievalModel(pl.LightningModule):
         
         if self.training_mode == 'transformer':
             if self.temporal_aware:
-                # ========== 音频侧：时序编码 ==========
+                # 时序模式 - 移除位置编码和时间编码，改为LayerNorm
                 B, N_actual, D = audio_embeddings.shape
                 
                 if N_actual > self.max_temporal_segments:
@@ -230,50 +229,39 @@ class AudioRetrievalModel(pl.LightningModule):
                     N_actual = self.max_temporal_segments
                     audio_embeddings = audio_embeddings[:, :N_actual, :]
                 
-                # 投影到1024维
-                audio_segments = []
-                for i in range(N_actual):
-                    seg_proj = self.audio_projection(audio_embeddings[:, i, :])
-                    audio_segments.append(seg_proj)
-                a_feat = torch.stack(audio_segments, dim=1)  # [B, N_actual, 1024]
+                # 优化：使用einsum代替循环投影 [B, N, 768] -> [B, N, 1024]
+                a_feat = torch.einsum('bnd,de->bne', audio_embeddings, self.audio_projection.weight.t())
+                if self.audio_projection.bias is not None:
+                    a_feat = a_feat + self.audio_projection.bias
                 
-                # ========== 关键：时间编码嵌入到音频段 ==========
-                # 1. 可学习的位置编码（第0段、第1段...）
-                a_feat = a_feat + self.temporal_pos_embedding[:N_actual].unsqueeze(0)
-                
-                # 2. 可选：绝对时间编码（将实际秒数编码为向量）
-                # 生成时间戳张量 [0, 10, 20, ...]
-                time_stamps = torch.arange(
-                    0, N_actual * self.segment_duration, self.segment_duration,
-                    device=a_feat.device, dtype=torch.float32
-                ).view(1, N_actual, 1)  # [1, N_actual, 1]
-                
-                # 将秒数编码为1024维向量并添加
-                time_encoding = self.absolute_time_encoding(time_stamps)  # [1, N_actual, 1024]
-                a_feat = a_feat + time_encoding
-                
-                # 不进行L2归一化，保留幅度
+                # 移除位置编码和时间编码，改为LayerNorm
+                # a_feat = a_feat + self.temporal_pos_embedding[:N_actual].unsqueeze(0)
+                # time_stamps = torch.arange(
+                #     0, N_actual * self.segment_duration, self.segment_duration,
+                #     device=a_feat.device, dtype=torch.float32
+                # ).view(1, N_actual, 1)
+                # time_encoding = self.absolute_time_encoding(time_stamps)
+                # a_feat = a_feat + time_encoding
+                a_feat = self.audio_ln(a_feat)
                 
             else:
                 # 非时序
                 a_feat = self.aggregate_audio_segments(audio_embeddings, batch['duration'])
                 a_feat = self.audio_ln(a_feat)
             
-            # ========== 文本侧：标准处理（无时间戳前缀）==========
-            # 移除了时间戳前缀生成，恢复标准文本清洗
+            # 文本处理 - 无论是否时序模式，都进行LayerNorm
             captions = []
             for i, b in enumerate([c[0] for c in batch['captions']]):
                 if not isinstance(b, str): 
                     b = b[0]
                 captions.append(b.lower().translate(str.maketrans('', '', string.punctuation)))
             
-            # 标准长度32（无需为时间戳预留空间）
             tokenized = self.tokenizer(
                 captions, 
                 add_special_tokens=True, 
                 padding='max_length', 
                 return_tensors='pt', 
-                max_length=32,  # 恢复标准长度
+                max_length=32,
                 truncation=True
             ).to(self.device)
     
@@ -283,9 +271,8 @@ class AudioRetrievalModel(pl.LightningModule):
             )[0][:, 0, :]  # [B, 1024]
             t_feat = self.text_projection(t_feat)
             
-            # 时序模式下不做LayerNorm（保留幅度给attention）
-            if not self.temporal_aware:
-                t_feat = self.text_ln(t_feat)
+            # 修改：无论是否时序模式，都进行LayerNorm
+            t_feat = self.text_ln(t_feat)
     
             return a_feat, t_feat
         else:
@@ -304,11 +291,14 @@ class AudioRetrievalModel(pl.LightningModule):
                 T = self.max_temporal_segments
                 audio_embeddings = audio_embeddings[:, :T, :]
             
-            audio_temp = []
-            for i in range(T):
-                seg = self.audio_projection(audio_embeddings[:, i, :])
-                audio_temp.append(seg)
-            audio_emb = torch.stack(audio_temp, dim=1).mean(dim=1)
+            # 矩阵化投影
+            audio_temp = torch.einsum('btd,de->bte', audio_embeddings, self.audio_projection.weight.t())
+            if self.audio_projection.bias is not None:
+                audio_temp = audio_temp + self.audio_projection.bias
+            
+            # 添加LayerNorm后再做mean聚合
+            audio_temp = self.audio_ln(audio_temp)
+            audio_emb = audio_temp.mean(dim=1)
         else:
             audio_emb = self.aggregate_audio_segments(audio_embeddings, batch['duration'])
             
@@ -316,7 +306,7 @@ class AudioRetrievalModel(pl.LightningModule):
         return audio_emb
 
     def forward_text(self, batch):
-        """Bi-encoder文本编码（标准处理，无时间戳）"""
+        """Bi-encoder文本编码"""
         device = self.device
         captions = []
         for i, b in enumerate([c[0] for c in batch['captions']]):
@@ -339,6 +329,9 @@ class AudioRetrievalModel(pl.LightningModule):
         )[0]
         sentence_features = token_embeddings[:, 0, :]
         sentence_features = self.text_projection(sentence_features)
+        
+        # 添加LayerNorm
+        sentence_features = self.text_ln(sentence_features)
         sentence_features = F.normalize(sentence_features, p=2, dim=-1)
         return sentence_features
 
@@ -354,16 +347,40 @@ class AudioRetrievalModel(pl.LightningModule):
             C = torch.matmul(audio_embeddings, text_embeddings.T) / torch.abs(self.tau)
         else:
             a_feat, t_feat = self.forward(batch)
-            C = torch.zeros((batch_size, batch_size), device=self.device)
             
             if self.temporal_aware:
-                # 时序Transformer
-                for i in range(batch_size):
-                    audio_i = a_feat[i].unsqueeze(0).expand(batch_size, -1, -1)
-                    C[i] = self.forward_fusion_temporal(audio_i, t_feat)
+                # ===== 关键修正：确保 C[i,j] = similarity(audio_i, text_j) =====
+                B = batch_size
+                
+                # 音频维度: [B, T, 1024] -> 在第0维保持音频批次(i)，第1维复制对应不同文本(j)
+                # 目标形状: [B, B, T, 1024] -> [B*B, T, 1024]
+                audio_expanded = a_feat.unsqueeze(1).expand(-1, B, -1, -1).reshape(B * B, -1, 1024)
+                
+                # 文本维度: [B, 1024] -> 在第0维复制对应不同音频(i)，第1维保持文本批次(j)
+                # 目标形状: [B, B, 1024] -> [B*B, 1024]
+                text_expanded = t_feat.unsqueeze(0).expand(B, -1, -1).reshape(B * B, 1024)
+                
+                # 批量计算所有B*B个样本对
+                scores = self.forward_fusion_temporal(audio_expanded, text_expanded)
+                C = scores.view(B, B)
             else:
-                for i in range(batch_size):
-                    C[i] = self.forward_fusion(a_feat[i].expand(batch_size, -1), t_feat)
+                # 非时序模式同样修正维度
+                B = batch_size
+                audio_expanded = a_feat.unsqueeze(1).expand(-1, B, -1).reshape(B * B, -1)
+                text_expanded = t_feat.unsqueeze(0).expand(B, -1, -1).reshape(B * B, -1)
+                
+                # 96G显存可设大chunk_size，如512或1024
+                chunk_size = 512  
+                scores_list = []
+                for i in range(0, B * B, chunk_size):
+                    end_i = min(i + chunk_size, B * B)
+                    scores_chunk = self.forward_fusion(
+                        audio_expanded[i:end_i], 
+                        text_expanded[i:end_i]
+                    )
+                    scores_list.append(scores_chunk)
+                scores = torch.cat(scores_list)
+                C = scores.view(B, B)
 
         C_audio = torch.log_softmax(C, dim=0) 
         C_text = torch.log_softmax(C, dim=1)
@@ -419,17 +436,29 @@ class AudioRetrievalModel(pl.LightningModule):
             C = torch.zeros((num_texts, num_audios), device=self.device)
             
             with torch.no_grad():
-                for i in range(num_texts):
-                    if self.temporal_aware:
-                        C[i] = self.forward_fusion_temporal(
-                            audio_embeddings, 
-                            text_embeddings[i].expand(num_audios, -1)
-                        )
-                    else:
-                        C[i] = self.forward_fusion(
-                            audio_embeddings, 
-                            text_embeddings[i].expand(num_audios, -1)
-                        )
+                if self.temporal_aware:
+                    # 分块批量处理（96G显存可设eval_chunk_size=64或128）
+                    chunk_size = self.eval_chunk_size
+                    for i in range(0, num_texts, chunk_size):
+                        end_i = min(i + chunk_size, num_texts)
+                        # 扩展文本: [chunk, 1, 1024] -> [chunk, num_audios, 1024]
+                        text_chunk = text_embeddings[i:end_i].unsqueeze(1).expand(-1, num_audios, -1)
+                        
+                        # 扩展音频: [num_audios, T, 1024] -> [chunk, num_audios, T, 1024] -> [chunk*num_audios, T, 1024]
+                        audio_chunk = audio_embeddings.unsqueeze(0).expand(end_i - i, -1, -1, -1).reshape(-1, audio_embeddings.shape[1], 1024)
+                        text_flat = text_chunk.reshape(-1, 1024)
+                        
+                        scores = self.forward_fusion_temporal(audio_chunk, text_flat)
+                        C[i:end_i] = scores.view(end_i - i, num_audios)
+                else:
+                    chunk_size = self.eval_chunk_size
+                    for i in range(0, num_texts, chunk_size):
+                        end_i = min(i + chunk_size, num_texts)
+                        text_chunk = text_embeddings[i:end_i].unsqueeze(1).expand(-1, num_audios, -1).reshape(-1, 1024)
+                        audio_chunk = audio_embeddings.unsqueeze(0).expand(end_i - i, -1, -1).reshape(-1, 1024)
+                        
+                        scores = self.forward_fusion(audio_chunk, text_chunk)
+                        C[i:end_i] = scores.view(end_i - i, num_audios)
         
         top_ten = C.topk(10, dim=1)[1].detach().cpu().numpy()
         target = np.array(target)

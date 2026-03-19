@@ -1,7 +1,3 @@
-git status
-git add .
-git commit -m "基础模型训练完成，尝试更多架构"
-git push
 
 # 设置学术环境
 source /etc/network_turbo

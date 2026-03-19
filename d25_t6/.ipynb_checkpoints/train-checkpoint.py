@@ -227,10 +227,10 @@ def get_args() -> dict:
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
     parser.add_argument('--batch_size_eval', type=int, default=64, help='Batch size for evaluation')
     parser.add_argument('--max_epochs', type=int, default=20, help='Maximum number of epochs')
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs')
+    parser.add_argument('--warmup_epochs', type=int, default=1, help='Number of warmup epochs')
     parser.add_argument('--rampdown_epochs', type=int, default=15, help='Number of ramp-down epochs')
     parser.add_argument('--max_lr', type=float, default=2e-5, help='Maximum learning rate')
-    parser.add_argument('--min_lr', type=float, default=2e-6, help='Minimum learning rate')
+    parser.add_argument('--min_lr', type=float, default=1e-7, help='Minimum learning rate')
     parser.add_argument('--initial_tau', type=float, default=0.05, help='Initial tau value')
     parser.add_argument('--tau_trainable', default=False, action=argparse.BooleanOptionalAction, help='Temperature parameter is trainable or not.')
 
@@ -357,7 +357,7 @@ if __name__ == '__main__':
                 target_sample_rate=32000,
                 max_length=30,
                 flat_captions=True,  # 展开为独立样本，增加多样性
-                sample_ratio=0.1
+                sample_ratio=0.39
             )
             wavcaps_local_ds = custom_loading(wavcaps_local_ds)
             train_ds = torch.utils.data.ConcatDataset([train_ds, wavcaps_local_ds])
